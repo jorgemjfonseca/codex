@@ -36,16 +36,22 @@ impl ResponsesWebsocketClient {
             .map_err(|err| ApiError::Stream(format!("failed to build websocket URL: {err}")))?;
         let headers = merge_request_headers(&self.provider.headers, extra_headers, default_headers);
         let headers = self.auth.apply_auth_headers(headers).await?;
-        let (stream, _response, server_reasoning_included, server_model) =
+        let (stream, response, server_reasoning_included, server_model) =
             connect_websocket(ws_url, headers, connector, turn_state)
                 .await
                 .map_err(|failure| *failure.error)?;
+        let upstream_request_id = ["x-request-id", "x-oai-request-id", "x-ms-request-id"]
+            .into_iter()
+            .find_map(|name| response.headers().get(name))
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         Ok(ResponsesWebsocketConnection::new(
             stream,
             self.provider.stream_idle_timeout,
             server_reasoning_included,
             server_model,
             telemetry,
+            upstream_request_id,
         ))
     }
 }

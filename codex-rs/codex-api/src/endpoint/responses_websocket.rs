@@ -179,6 +179,8 @@ const PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE: &str =
     "Previous response was not found. Retrying the full request.";
 const RESPONSES_WEBSOCKET_TIMING_KIND: &str = "responsesapi.websocket_timing";
 const RESPONSES_WEBSOCKET_TIMING_EVENT_TARGET: &str = "codex_api::responses_websocket_timing";
+const RESPONSES_WEBSOCKET_STREAM_END_EVENT_TARGET: &str =
+    "codex_api::responses_websocket_stream_end";
 const SESSION_ID_CLIENT_METADATA_KEY: &str = "session_id";
 const THREAD_ID_CLIENT_METADATA_KEY: &str = "thread_id";
 const TURN_ID_CLIENT_METADATA_KEY: &str = "turn_id";
@@ -194,6 +196,8 @@ struct ResponsesWebsocketTimingLogContext {
     request_start_ms: Option<String>,
     warmup: bool,
     connection_reused: bool,
+    connection_id: String,
+    upstream_request_id: Option<String>,
 }
 
 pub struct ResponsesWebsocketConnection {
@@ -204,6 +208,8 @@ pub struct ResponsesWebsocketConnection {
     server_reasoning_included: bool,
     server_model: Option<String>,
     telemetry: Option<Arc<dyn WebsocketTelemetry>>,
+    connection_id: String,
+    upstream_request_id: Option<String>,
 }
 
 impl std::fmt::Debug for ResponsesWebsocketConnection {
@@ -225,6 +231,7 @@ impl ResponsesWebsocketConnection {
         server_reasoning_included: bool,
         server_model: Option<String>,
         telemetry: Option<Arc<dyn WebsocketTelemetry>>,
+        upstream_request_id: Option<String>,
     ) -> Self {
         let routing_affinity = stream.routing_affinity.take();
         Self {
@@ -234,6 +241,8 @@ impl ResponsesWebsocketConnection {
             server_model,
             telemetry,
             routing_affinity,
+            connection_id: uuid::Uuid::new_v4().to_string(),
+            upstream_request_id,
         }
     }
 
@@ -289,6 +298,8 @@ impl ResponsesWebsocketConnection {
                 .cloned(),
             warmup: ws_request.generate == Some(false),
             connection_reused,
+            connection_id: self.connection_id.clone(),
+            upstream_request_id: self.upstream_request_id.clone(),
         };
         let request_text = serialize_websocket_request(&request)?;
 
@@ -781,6 +792,7 @@ async fn run_websocket_response_stream(
     completion: &mut Option<ResponseEvent>,
 ) -> Result<(), ApiError> {
     let mut last_server_model: Option<String> = None;
+    let mut last_event_kind: Option<String> = None;
     let mut safety_buffering_treatment = SafetyBufferingTreatment::default();
     if matches!(
         interrupt.clone().now_or_never(),
@@ -833,14 +845,41 @@ async fn run_websocket_response_stream(
         let message = match response {
             Ok(Some(Ok(msg))) => msg,
             Ok(Some(Err(err))) => {
+                let outcome = match &err {
+                    WsError::Tls(_) => "tls_error",
+                    WsError::Io(error) if matches!(error.get_ref(), Some(source) if source.is::<rustls::Error>()) => {
+                        "tls_error"
+                    }
+                    WsError::Io(_) => "io_error",
+                    WsError::Protocol(_) => "protocol_error",
+                    _ => "transport_error",
+                };
+                log_websocket_stream_end(
+                    outcome,
+                    None,
+                    last_event_kind.as_deref(),
+                    timing_log_context,
+                );
                 return Err(map_ws_stream_error(err));
             }
             Ok(None) => {
+                log_websocket_stream_end(
+                    "eof",
+                    None,
+                    last_event_kind.as_deref(),
+                    timing_log_context,
+                );
                 return Err(ApiError::Stream(
                     "stream closed before response.completed".into(),
                 ));
             }
             Err(err) => {
+                log_websocket_stream_end(
+                    "idle_timeout",
+                    None,
+                    last_event_kind.as_deref(),
+                    timing_log_context,
+                );
                 return Err(err);
             }
         };
@@ -861,6 +900,7 @@ async fn run_websocket_response_stream(
                         continue;
                     }
                 };
+                last_event_kind = Some(event.kind().to_owned());
                 if matches!(interruption, Some(ResponseInterrupt::Cancel { .. }))
                     && matches!(
                         event.kind(),
@@ -977,7 +1017,13 @@ async fn run_websocket_response_stream(
             Message::Binary(_) => {
                 return Err(ApiError::Stream("unexpected binary websocket event".into()));
             }
-            Message::Close(_) => {
+            Message::Close(frame) => {
+                log_websocket_stream_end(
+                    "close_frame",
+                    frame.as_ref(),
+                    last_event_kind.as_deref(),
+                    timing_log_context,
+                );
                 return Err(ApiError::Stream(
                     "websocket closed by server before response.completed".into(),
                 ));
@@ -988,6 +1034,39 @@ async fn run_websocket_response_stream(
     }
 
     Ok(())
+}
+
+fn websocket_close_metadata(frame: Option<&CloseFrame>) -> (Option<u16>, Option<&str>) {
+    frame.map_or((None, None), |frame| {
+        (Some(u16::from(frame.code)), Some(frame.reason.as_ref()))
+    })
+}
+
+fn log_websocket_stream_end(
+    outcome: &str,
+    frame: Option<&CloseFrame>,
+    last_event_kind: Option<&str>,
+    context: &ResponsesWebsocketTimingLogContext,
+) {
+    let (close_code, close_reason) = websocket_close_metadata(frame);
+    tracing::event!(
+        name: "responsesapi.websocket_stream_end",
+        target: RESPONSES_WEBSOCKET_STREAM_END_EVENT_TARGET,
+        tracing::Level::WARN,
+        outcome,
+        ?close_code,
+        ?close_reason,
+        ?last_event_kind,
+        model = context.model.as_str(),
+        session_id = ?context.session_id.as_deref(),
+        thread_id = ?context.thread_id.as_deref(),
+        turn_id = ?context.turn_id.as_deref(),
+        traceparent = ?context.traceparent.as_deref(),
+        connection_id = context.connection_id.as_str(),
+        upstream_request_id = ?context.upstream_request_id.as_deref(),
+        connection_reused = context.connection_reused,
+        "Responses websocket stream ended before response.completed"
+    );
 }
 
 fn emit_responses_websocket_timing_event(
@@ -1080,7 +1159,25 @@ mod tests {
     use serde_json::value::RawValue;
     use serde_json::value::to_raw_value;
     use std::collections::HashMap;
+    use std::io::Write;
     use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
+
+    struct LogWriter(Arc<StdMutex<Vec<u8>>>);
+
+    impl Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log writer mutex")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn direct_serialization_preserves_websocket_request_payload() {
@@ -1152,6 +1249,67 @@ mod tests {
     fn websocket_config_enables_permessage_deflate() {
         let config = websocket_config();
         assert!(config.extensions.permessage_deflate.is_some());
+    }
+
+    #[test]
+    fn close_metadata_distinguishes_frame_with_reason_from_missing_frame() {
+        let frame = CloseFrame {
+            code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
+            reason: "server policy".into(),
+        };
+        assert_eq!(
+            websocket_close_metadata(Some(&frame)),
+            (Some(1008), Some("server policy"))
+        );
+        assert_eq!(websocket_close_metadata(None), (None, None));
+    }
+
+    #[test]
+    fn websocket_stream_end_log_records_close_context_without_request_payload() {
+        let output = Arc::new(StdMutex::new(Vec::new()));
+        let writer = Arc::clone(&output);
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_writer(move || LogWriter(Arc::clone(&writer)))
+            .finish();
+        let frame = CloseFrame {
+            code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
+            reason: "server policy".into(),
+        };
+        let context = ResponsesWebsocketTimingLogContext {
+            model: "gpt-test".into(),
+            session_id: None,
+            thread_id: Some("thread-1".into()),
+            turn_id: Some("turn-1".into()),
+            traceparent: None,
+            previous_response_id: None,
+            request_start_ms: None,
+            warmup: false,
+            connection_reused: true,
+            connection_id: "socket-1".into(),
+            upstream_request_id: Some("req-1".into()),
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            log_websocket_stream_end(
+                "close_frame",
+                Some(&frame),
+                Some("response.output_text.delta"),
+                &context,
+            );
+        });
+        let log = String::from_utf8(output.lock().expect("log writer mutex").clone())
+            .expect("UTF-8 log line");
+        for field in [
+            "close_frame",
+            "close_code=Some(1008)",
+            "close_reason=Some(\"server policy\")",
+            "last_event_kind=Some(\"response.output_text.delta\")",
+            "socket-1",
+            "upstream_request_id=Some(\"req-1\")",
+        ] {
+            assert!(log.contains(field), "missing {field}: {log}");
+        }
+        assert!(!log.contains("request_payload"));
     }
 
     #[test]
